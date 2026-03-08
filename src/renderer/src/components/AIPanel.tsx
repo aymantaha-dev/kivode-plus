@@ -79,6 +79,10 @@ interface ChatSession {
   updatedAt: Date;
 }
 
+const DEFAULT_CHAT_TITLE = 'New Chat';
+const TITLE_SOURCE_MESSAGE_LIMIT = 6;
+const MIN_USER_MESSAGES_FOR_TITLE = 3;
+
 interface GeneratedProjectFile {
   path: string;
   content: string;
@@ -524,7 +528,6 @@ export function AIPanel() {
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [showHistory, setShowHistory] = useState(false);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
-  const [isInitialized, setIsInitialized] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [draftSaved, setDraftSaved] = useState(false);
@@ -1743,16 +1746,14 @@ Rules:
     }
   }, []);
 
-  // Initializes a new session and prevents duplicate invocations.
-  const initializeSession = useCallback(async () => {
-    if (isInitialized) return;
-    
+  // Creates a session only when the user actually starts messaging.
+  const createSession = useCallback(async (): Promise<string> => {
     const sessionId = Date.now().toString();
     await fetchInitialProjectSnapshot();
     
     const newSession: ChatSession = {
       id: sessionId,
-      title: projectName ? `Chat - ${projectName}` : 'General Chat',
+      title: DEFAULT_CHAT_TITLE,
       messages: [],
       projectContext: {
         path: projectPath || null,
@@ -1770,18 +1771,60 @@ Rules:
       saveSessions(updated);
       return updated;
     });
-    setIsInitialized(true);
-  }, [projectPath, fileTree, openFiles, projectName, saveSessions, isInitialized]);
+    return sessionId;
+  }, [projectPath, fileTree, openFiles, saveSessions, fetchInitialProjectSnapshot]);
 
-  // Ensures an active session with a small debounce delay.
-  useEffect(() => {
-    if (!currentSessionId && !isInitialized) {
-      const timer = setTimeout(() => {
-        initializeSession();
-      }, 100);
-      return () => clearTimeout(timer);
+  const maybeGenerateSessionTitle = useCallback(async (sessionId: string, conversation: Message[]) => {
+    const userMessageCount = conversation.filter((msg) => msg.role === 'user').length;
+    if (userMessageCount < MIN_USER_MESSAGES_FOR_TITLE) {
+      return;
     }
-  }, [currentSessionId, initializeSession, isInitialized]);
+
+    const titleContext = conversation
+      .slice(0, TITLE_SOURCE_MESSAGE_LIMIT)
+      .map((msg) => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`)
+      .join('\n');
+
+    const projectHint = projectName ? `Project name: ${projectName}` : 'Project name: none';
+
+    try {
+      const result = await window.electronAPI.ai.reviewCode({
+        model: selectedModel,
+        prompt: `Generate a professional and concise chat title based on the current topic.
+- Output JSON only with schema: {"title":"..."}
+- Maximum 6 words.
+- Do not copy the first user message literally.
+- If a project analysis is requested, include project name when available.
+
+${projectHint}
+Conversation snippet:
+${titleContext}`,
+        systemPrompt: 'You are a chat title generator. Return strict JSON only.',
+        temperature: 0.2,
+        maxTokens: 60,
+        operation: 'review',
+      });
+
+      const parsed = extractJsonInstruction(result?.content || '');
+      const candidate = String(parsed?.title || '').trim();
+      if (!candidate) return;
+
+      setChatSessions((prev) => {
+        let changed = false;
+        const updated = prev.map((entry) => {
+          if (entry.id !== sessionId || entry.title !== DEFAULT_CHAT_TITLE) return entry;
+          changed = true;
+          return { ...entry, title: candidate, updatedAt: new Date() };
+        });
+        if (changed) {
+          saveSessions(updated);
+        }
+        return updated;
+      });
+    } catch {
+      // Keep default title if generation fails.
+    }
+  }, [projectName, saveSessions, selectedModel]);
 
   // Auto-scroll follows responses only when the user is near the bottom.
   useEffect(() => {
@@ -1850,20 +1893,17 @@ Rules:
   const startNewChat = () => {
     setCurrentSessionId(null);
     setMessages([]);
-    setIsInitialized(false);
     setShowHistory(false);
     setInput('');
     setAttachedFiles([]);
     sentAttachmentContextRef.current.clear();
     sessionAttachmentStoreRef.current.clear();
-    setTimeout(() => initializeSession(), 50);
   };
 
   // Loads an existing session.
   const loadSession = (session: ChatSession) => {
     setCurrentSessionId(session.id);
     setMessages(session.messages);
-    setIsInitialized(true);
     setShowHistory(false);
     sentAttachmentContextRef.current.clear();
     sessionAttachmentStoreRef.current.clear();
@@ -2101,7 +2141,13 @@ Rules:
   // Sends a message.
   const handleSend = async (options?: { promptOverride?: string; baseMessagesOverride?: Message[]; clearComposer?: boolean }) => {
     const composedPrompt = options?.promptOverride ?? input;
-    if (!composedPrompt.trim() || isGenerating || !currentSessionId) return;
+    if (!composedPrompt.trim() || isGenerating) return;
+
+    let sessionId = currentSessionId;
+    if (!sessionId) {
+      sessionId = await createSession();
+    }
+    const activeSessionId = sessionId;
 
     const sourceMessages = options?.baseMessagesOverride
       ?? (editingMessageId
@@ -2139,6 +2185,9 @@ Rules:
     // Create an AbortController for cancellation.
     abortControllerRef.current = new AbortController();
     currentAIRequestIdRef.current = createRequestId();
+
+    let pendingTitleSessionId: string | null = null;
+    let pendingTitleConversation: Message[] | null = null;
 
     try {
       const analyzedAttachments = availableAttachments;
@@ -2700,7 +2749,7 @@ Return strict JSON only.`,
       // Updates session state.
       setChatSessions(prev => {
         const updated = prev.map(s => 
-          s.id === currentSessionId 
+          s.id === activeSessionId 
             ? { ...s, messages: finalMessages, updatedAt: new Date() }
             : s
         );
@@ -2708,8 +2757,11 @@ Return strict JSON only.`,
         return updated;
       });
 
+      pendingTitleSessionId = activeSessionId;
+      pendingTitleConversation = finalMessages;
+
       // Clears drafts after successful send.
-      localStorage.removeItem(`kivode-draft-${currentSessionId}`);
+      localStorage.removeItem(`kivode-draft-${activeSessionId}`);
 
     } catch (error: any) {
       if (error.name === 'AbortError') {
@@ -2742,6 +2794,10 @@ Return strict JSON only.`,
       setIsGenerating(false);
       abortControllerRef.current = null;
       currentAIRequestIdRef.current = null;
+
+      if (pendingTitleSessionId && pendingTitleConversation) {
+        await maybeGenerateSessionTitle(pendingTitleSessionId, pendingTitleConversation);
+      }
     }
   };
 
