@@ -29,7 +29,7 @@ interface SettingsPanelProps {
 type UpdateStatus = 'idle' | 'checking' | 'available' | 'up-to-date' | 'error';
 type Provider = 'openai' | 'anthropic' | 'moonshot' | 'deepseek' | 'google';
 
-const UPDATE_FEED_URL = 'https://aymantaha-dev.github.io/Kivode-Plus/version.json';
+const UPDATE_FEED_URL = 'https://kivode.com/version.json';
 
 const providerMeta: Record<Provider, { name: string }> = {
   openai: { name: 'OpenAI' },
@@ -264,7 +264,7 @@ export function SettingsPanel({ onOpenGuide }: SettingsPanelProps) {
                     <Button variant="outline" className="rounded-full" onClick={() => window.electronAPI.shell.openPath('https://x.com')}>
                       <MessageCircle className="mr-2 h-4 w-4" />X / Twitter
                     </Button>
-                    <Button variant="outline" className="rounded-full" onClick={() => window.electronAPI.shell.openPath('https://kivode.plus')}>
+                    <Button variant="outline" className="rounded-full" onClick={() => window.electronAPI.shell.openPath('https://kivode.com')}>
                       <Globe className="mr-2 h-4 w-4" />Website
                     </Button>
                     <Button variant="outline" className="rounded-full" onClick={onOpenGuide}>
