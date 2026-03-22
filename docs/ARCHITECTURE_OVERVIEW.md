@@ -32,3 +32,7 @@
 ## Diagram placeholders
 - TODO: Sequence diagram for renderer-to-main IPC.
 - TODO: Component diagram for sandboxed Python runtime.
+
+## Additional Design References
+
+- Arabic implementation blueprint for local coding agent runtime: `docs/LOCAL_CODE_AGENT_RUNTIME_PLAN_AR.md`

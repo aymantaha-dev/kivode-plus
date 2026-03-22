@@ -42,3 +42,7 @@ Primary service modules in `src/main/services`:
 - Main: TypeScript compiler
 - Packaging: electron-builder
 - Verification: custom scripts in `scripts/`
+
+## Additional Design References
+
+- Arabic implementation blueprint for local coding agent runtime: `docs/LOCAL_CODE_AGENT_RUNTIME_PLAN_AR.md`

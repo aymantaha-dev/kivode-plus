@@ -10,7 +10,35 @@ export interface PythonEnvResult {
 }
 
 export interface PythonCommandPayload {
-  action: 'analyze_project' | 'smart_search' | 'replace_body' | 'apply_patch' | 'open_file' | 'create_file' | 'validate' | 'summarize_attachment' | 'load_attachment';
+  action:
+    | 'analyze_project'
+    | 'index_project_cache'
+    | 'smart_search'
+    | 'search_files'
+    | 'search_symbols'
+    | 'replace_body'
+    | 'apply_patch'
+    | 'open_file'
+    | 'read_file'
+    | 'read_symbol'
+    | 'create_file'
+    | 'validate'
+    | 'get_repo_summary'
+    | 'get_file_summary'
+    | 'get_related_files'
+    | 'get_changed_files'
+    | 'plan_task'
+    | 'retrieve_context'
+    | 'create_snapshot'
+    | 'rollback_snapshot'
+    | 'get_last_errors'
+    | 'run_format'
+    | 'run_lint'
+    | 'run_tests'
+    | 'run_build'
+    | 'list_project_files'
+    | 'summarize_attachment'
+    | 'load_attachment';
   [key: string]: any;
 }
 
@@ -21,7 +49,7 @@ interface SearchResultItem {
 
 interface PythonCandidate {
   bin: string;
-  runtime: 'bundled' | 'system';
+  runtime: 'bundled';
 }
 
 export class PythonEnvService {
@@ -61,14 +89,7 @@ export class PythonEnvService {
 
   private resolvePythonCandidates(): PythonCandidate[] {
     const bundled = this.resolveBundledPythonBinary();
-    const systemCandidates = process.platform === 'win32' ? ['python', 'py'] : ['python3', 'python'];
-
-    if (app.isPackaged) {
-      return bundled ? [{ bin: bundled, runtime: 'bundled' }] : [];
-    }
-
-    const base = bundled ? [{ bin: bundled, runtime: 'bundled' as const }] : [];
-    return [...base, ...systemCandidates.map((bin) => ({ bin, runtime: 'system' as const }))];
+    return bundled ? [{ bin: bundled, runtime: 'bundled' }] : [];
   }
 
   private resolvePythonScriptPath(): string {
@@ -93,7 +114,7 @@ export class PythonEnvService {
         {
           timeout: 15000,
           maxBuffer: 2 * 1024 * 1024,
-          env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+          env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', KIVODE_SELF_CONTAINED: '1', KIVODE_BUNDLED_PYTHON: pythonBin },
         },
         (error, stdout, stderr) => {
           if (error) {
@@ -118,8 +139,8 @@ export class PythonEnvService {
       throw new Error(`Python helper script was not found at: ${scriptPath}`);
     }
 
-    if (app.isPackaged && pythonCandidates.length === 0) {
-      throw new Error('Bundled Python runtime is unavailable in this build.');
+    if (pythonCandidates.length === 0) {
+      throw new Error('Bundled Python runtime is unavailable. System Python fallback is disabled by policy.');
     }
 
     let lastError: Error | null = null;

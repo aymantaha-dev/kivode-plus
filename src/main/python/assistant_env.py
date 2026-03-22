@@ -2,18 +2,29 @@
 import argparse
 import ast
 import difflib
+import hashlib
 import json
+import py_compile
 import os
 import re
+import shutil
+import sqlite3
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 MAX_FILE_SIZE = 300_000
 IGNORE_DIRS = {'.git', 'node_modules', 'dist', 'build', '.next', '.idea', '.vscode', '__pycache__'}
 TEXT_EXTENSIONS = {
     '.ts', '.tsx', '.js', '.jsx', '.json', '.md', '.py', '.css', '.scss', '.html', '.yml', '.yaml', '.toml', '.rs', '.go', '.java', '.sh'
 }
+
+INTERNAL_STATE_DIR = '.kivode_agent'
+SNAPSHOT_DIR = 'snapshots'
+LAST_ERRORS_FILE = 'last_errors.json'
+INDEX_DB_FILE = 'index.sqlite3'
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -293,12 +304,371 @@ def create_file(root: Path, relative: str, content: str) -> Dict[str, Any]:
     return {"path": safe, "size": len(content)}
 
 
-def run_validations(root: Path) -> Dict[str, Any]:
-    # restricted, no system command execution by default.
+def _agent_state_dir(root: Path) -> Path:
+    target = root / INTERNAL_STATE_DIR
+    ensure_in_root(root, target)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _safe_run(root: Path, cmd: List[str], timeout_s: int = 90) -> Dict[str, Any]:
+    if not cmd:
+        return {"ok": False, "exit_code": 1, "stdout": "", "stderr": "empty command"}
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout_s),
+            env={**os.environ, 'PYTHONIOENCODING': 'utf-8', 'PYTHONUTF8': '1'},
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "stdout": (proc.stdout or '')[:16000],
+            "stderr": (proc.stderr or '')[:16000],
+            "command": ' '.join(cmd),
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "exit_code": 124, "stdout": "", "stderr": "command timeout", "command": ' '.join(cmd)}
+    except Exception as exc:
+        return {"ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc), "command": ' '.join(cmd)}
+
+
+def _has_tool(binary: str) -> bool:
+    if _self_contained_mode():
+        if binary == 'python':
+            return Path(_bundled_python()).exists()
+        return False
+    return shutil.which(binary) is not None
+
+
+def _self_contained_mode() -> bool:
+    return os.environ.get('KIVODE_SELF_CONTAINED', '1') != '0'
+
+
+def _bundled_python() -> str:
+    return os.environ.get('KIVODE_BUNDLED_PYTHON', sys.executable)
+
+
+
+
+
+def _python_compile_check(root: Path) -> Dict[str, Any]:
+    errors: List[str] = []
+    checked = 0
+    for file_path in iter_files(root):
+        if file_path.suffix.lower() != '.py':
+            continue
+        checked += 1
+        try:
+            py_compile.compile(str(file_path), doraise=True)
+        except Exception as exc:
+            errors.append(f"{rel_path(root, file_path)}: {exc}")
+            if len(errors) >= 20:
+                break
     return {
-        "linter": {"status": "skipped", "reason": "Restricted mode"},
-        "formatter": {"status": "skipped", "reason": "Restricted mode"},
-        "tests": {"status": "skipped", "reason": "Restricted mode"},
+        "ok": len(errors) == 0,
+        "exit_code": 0 if len(errors) == 0 else 1,
+        "checked_files": checked,
+        "stdout": '' if len(errors) == 0 else '\n'.join(errors),
+        "stderr": '' if len(errors) == 0 else '\n'.join(errors),
+        "command": 'internal:py_compile',
+    }
+
+def _write_last_errors(root: Path, errors: List[Dict[str, Any]]) -> None:
+    state = _agent_state_dir(root)
+    payload = {
+        "updated_at": datetime.utcnow().isoformat() + 'Z',
+        "errors": errors,
+    }
+    (state / LAST_ERRORS_FILE).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def _read_last_errors(root: Path) -> Dict[str, Any]:
+    state = _agent_state_dir(root)
+    target = state / LAST_ERRORS_FILE
+    if not target.exists():
+        return {"updated_at": None, "errors": []}
+    try:
+        return json.loads(target.read_text(encoding='utf-8'))
+    except Exception:
+        return {"updated_at": None, "errors": []}
+
+
+def run_validations(root: Path, paths: Optional[List[str]] = None, tests: Optional[List[str]] = None) -> Dict[str, Any]:
+    selected_paths = [p for p in (paths or []) if isinstance(p, str) and p.strip()]
+    selected_tests = [t for t in (tests or []) if isinstance(t, str) and t.strip()]
+
+    checks: List[Tuple[str, List[str], str]] = []
+    checks.append(('format', [], 'syntax/compile check (internal)'))
+
+    if not _self_contained_mode() and _has_tool('ruff'):
+        checks.append(('lint', ['ruff', 'check', '.'], 'ruff lint'))
+    if not _self_contained_mode() and _has_tool('pytest'):
+        checks.append(('tests', ['pytest', '-q', *(selected_tests or [])], 'pytest targeted'))
+
+    results: Dict[str, Any] = {}
+    failures: List[Dict[str, Any]] = []
+    for key, command, label in checks:
+        res = _python_compile_check(root) if key == 'format' else _safe_run(root, command)
+        res['label'] = label
+        if selected_paths:
+            res['paths'] = selected_paths
+        results[key] = res
+        if not res.get('ok'):
+            failures.append({
+                "tool": key,
+                "command": res.get('command'),
+                "exit_code": res.get('exit_code'),
+                "message": (res.get('stderr') or res.get('stdout') or '').splitlines()[:20],
+            })
+
+    if _self_contained_mode():
+        results['lint'] = {"ok": True, "skipped": True, "reason": 'Disabled in strict self-contained mode unless bundled linter is configured.'}
+        results['tests'] = {"ok": True, "skipped": True, "reason": 'Disabled in strict self-contained mode unless bundled test runner is configured.'}
+
+    _write_last_errors(root, failures)
+    return {
+        "summary": "Validation passed" if not failures else "Validation completed with failures",
+        "results": results,
+        "ok": not failures,
+    }
+
+
+def create_snapshot(root: Path, note: str = '') -> Dict[str, Any]:
+    state = _agent_state_dir(root)
+    snap_root = state / SNAPSHOT_DIR
+    snap_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S-%f')
+    snapshot_id = f'snap-{stamp}'
+    target = snap_root / snapshot_id
+    target.mkdir(parents=True, exist_ok=True)
+
+    for file_path in iter_files(root):
+        rel = rel_path(root, file_path)
+        if rel.startswith(f"{INTERNAL_STATE_DIR}/"):
+            continue
+        dst = target / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(file_path, dst)
+        except OSError:
+            continue
+
+    meta = {
+        "snapshot_id": snapshot_id,
+        "created_at": datetime.utcnow().isoformat() + 'Z',
+        "note": note[:500],
+    }
+    (target / 'meta.json').write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
+    return meta
+
+
+def rollback_snapshot(root: Path, snapshot_id: str) -> Dict[str, Any]:
+    if not snapshot_id:
+        raise ValueError('snapshot_id is required')
+    state = _agent_state_dir(root)
+    source = state / SNAPSHOT_DIR / snapshot_id
+    ensure_in_root(root, source)
+    if not source.exists() or not source.is_dir():
+        raise ValueError('snapshot not found')
+
+    restored = 0
+    for path in source.rglob('*'):
+        if path.name == 'meta.json' or not path.is_file():
+            continue
+        rel = str(path.relative_to(source)).replace('\\', '/')
+        dst = root / rel
+        ensure_in_root(root, dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dst)
+        restored += 1
+    return {"snapshot_id": snapshot_id, "restored_files": restored}
+
+
+def _line_span(content: str, start_line: int, end_line: int) -> str:
+    lines = content.splitlines()
+    s = max(1, start_line)
+    e = max(s, end_line)
+    return '\n'.join(lines[s - 1:e])
+
+
+def read_file_span(root: Path, file_rel: str, start_line: int = 1, end_line: int = 200) -> Dict[str, Any]:
+    rel = file_rel.replace('\\', '/').strip().lstrip('./')
+    if not rel or '..' in rel.split('/'):
+        raise ValueError('Unsafe file path')
+    target = root / rel
+    ensure_in_root(root, target)
+    if not target.exists():
+        raise ValueError('Target file does not exist')
+    content = target.read_text(encoding='utf-8', errors='ignore')
+    return {
+        "path": rel,
+        "start_line": max(1, int(start_line)),
+        "end_line": max(1, int(end_line)),
+        "content": _line_span(content, int(start_line), int(end_line)),
+    }
+
+
+def _extract_symbols_for_file(path: Path, content: str) -> Dict[str, Any]:
+    if path.suffix.lower() == '.py':
+        return extract_python_symbols(content)
+    return extract_generic_symbols(content, path.suffix.lower())
+
+
+def search_symbols(root: Path, query: str, limit: int = 25) -> List[Dict[str, Any]]:
+    query_norm = query.strip().lower()
+    if not query_norm:
+        return []
+    hits: List[Dict[str, Any]] = []
+    for path in iter_files(root):
+        rel = rel_path(root, path)
+        try:
+            content = path.read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            continue
+        symbols = _extract_symbols_for_file(path, content)
+        for symbol_type in ('functions', 'classes'):
+            for item in symbols.get(symbol_type, []):
+                name = str(item.get('name', ''))
+                if query_norm in name.lower():
+                    hits.append({
+                        "path": rel,
+                        "symbol_name": name,
+                        "symbol_type": symbol_type[:-1],
+                        "start_line": item.get('line_start', 1),
+                        "end_line": item.get('line_end', item.get('line_start', 1)),
+                    })
+    hits.sort(key=lambda h: (h['path'], h['symbol_name']))
+    return hits[:max(1, int(limit))]
+
+
+def get_repo_summary(root: Path) -> Dict[str, Any]:
+    files = list(iter_files(root))
+    lang_counts: Dict[str, int] = {}
+    total_size = 0
+    for f in files:
+        suffix = (f.suffix.lower() or 'no_ext').lstrip('.')
+        lang_counts[suffix] = lang_counts.get(suffix, 0) + 1
+        try:
+            total_size += f.stat().st_size
+        except OSError:
+            pass
+    return {
+        "root": str(root),
+        "file_count": len(files),
+        "size_bytes": total_size,
+        "languages": dict(sorted(lang_counts.items(), key=lambda kv: kv[1], reverse=True)[:12]),
+    }
+
+
+def get_file_summary(root: Path, file_rel: str) -> Dict[str, Any]:
+    rel = file_rel.replace('\\', '/').strip().lstrip('./')
+    if not rel or '..' in rel.split('/'):
+        raise ValueError('Unsafe file path')
+    target = root / rel
+    ensure_in_root(root, target)
+    if not target.exists():
+        raise ValueError('Target file does not exist')
+    content = target.read_text(encoding='utf-8', errors='ignore')
+    symbols = _extract_symbols_for_file(target, content)
+    return {
+        "path": rel,
+        "lines": len(content.splitlines()),
+        "chars": len(content),
+        "imports": len(symbols.get('imports', [])),
+        "functions": len(symbols.get('functions', [])),
+        "classes": len(symbols.get('classes', [])),
+        "preview": '\n'.join(content.splitlines()[:40]),
+        "hash": hashlib.sha256(content.encode('utf-8', errors='ignore')).hexdigest(),
+    }
+
+
+def get_related_files(root: Path, file_rel: str, limit: int = 12) -> List[str]:
+    rel = file_rel.replace('\\', '/').strip().lstrip('./')
+    base = Path(rel).stem.lower()
+    related: List[str] = []
+    for p in iter_files(root):
+        current = rel_path(root, p)
+        low = current.lower()
+        if current == rel:
+            continue
+        if base and base in low:
+            related.append(current)
+            continue
+        if 'test' in low and Path(rel).parent.name and Path(rel).parent.name.lower() in low:
+            related.append(current)
+    related = sorted(set(related))
+    return related[:max(1, int(limit))]
+
+
+def get_changed_files(root: Path) -> List[str]:
+    if _self_contained_mode():
+        return []
+    if not (root / '.git').exists() or not _has_tool('git'):
+        return []
+    result = _safe_run(root, ['git', 'status', '--porcelain'])
+    if not result.get('ok') and not result.get('stdout'):
+        return []
+    files: List[str] = []
+    for raw in (result.get('stdout') or '').splitlines():
+        if len(raw) < 4:
+            continue
+        files.append(raw[3:].strip())
+    return files
+
+
+def _classify_intent(task: str) -> str:
+    t = task.lower()
+    if any(k in t for k in ['explain', 'اشرح', 'explanation']):
+        return 'explain'
+    if any(k in t for k in ['test', 'pytest', 'unit test', 'اختبار']):
+        return 'generate_tests'
+    if any(k in t for k in ['refactor', 'اعادة هيكلة']):
+        return 'refactor'
+    if any(k in t for k in ['error', 'bug', 'fix', 'failed', 'خطأ', 'اصلاح']):
+        return 'analyze_error'
+    return 'edit_code'
+
+
+def plan_task(task: str) -> Dict[str, Any]:
+    intent = _classify_intent(task)
+    risk = 'high' if intent in {'refactor'} else 'medium' if intent in {'analyze_error'} else 'low'
+    return {
+        "intent": intent,
+        "scope": "small",
+        "read_more": True,
+        "files_to_open": [],
+        "symbols_to_open": [],
+        "line_ranges": [],
+        "needs_tests": intent in {'edit_code', 'analyze_error', 'generate_tests', 'refactor'},
+        "risk_level": risk,
+        "expected_output": "explanation" if intent == 'explain' else "patch",
+    }
+
+
+def retrieve_context(root: Path, task: str, max_files: int = 5, span_lines: int = 140) -> Dict[str, Any]:
+    results = search_project(root, task, 'keyword', max_files)
+    files: List[Dict[str, Any]] = []
+    for hit in results[:max(1, int(max_files))]:
+        rel = hit.get('path', '')
+        try:
+            opened = read_file_span(root, rel, 1, int(span_lines))
+            files.append({
+                "path": rel,
+                "score": hit.get('score', 0),
+                "matches": hit.get('matches', []),
+                "span": opened.get('content', ''),
+            })
+        except Exception:
+            continue
+    return {
+        "task": task,
+        "repo_summary": get_repo_summary(root),
+        "files": files,
     }
 
 
@@ -539,6 +909,45 @@ def apply_patch_action(root: Path, command: Dict[str, Any]) -> Dict[str, Any]:
         "patchStrategy": strategy,
     })
 
+
+def persist_index_sqlite(root: Path, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    state = _agent_state_dir(root)
+    db_path = state / INDEX_DB_FILE
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute('CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, language TEXT, file_hash TEXT, modified_at TEXT, size_bytes INTEGER, summary TEXT)')
+        conn.execute('CREATE TABLE IF NOT EXISTS symbols(path TEXT, symbol_name TEXT, symbol_type TEXT, start_line INTEGER, end_line INTEGER)')
+        conn.execute('DELETE FROM files')
+        conn.execute('DELETE FROM symbols')
+
+        for entry in entries:
+            rel = str(entry.get('path', ''))
+            target = root / rel
+            language = Path(rel).suffix.lower().lstrip('.')
+            try:
+                content = target.read_text(encoding='utf-8', errors='ignore')
+                stat = target.stat()
+            except OSError:
+                continue
+            content_hash = hashlib.sha256(content.encode('utf-8', errors='ignore')).hexdigest()
+            summary = '\n'.join(content.splitlines()[:12])
+            conn.execute(
+                'INSERT OR REPLACE INTO files(path, language, file_hash, modified_at, size_bytes, summary) VALUES (?,?,?,?,?,?)',
+                (rel, language, content_hash, datetime.utcfromtimestamp(stat.st_mtime).isoformat() + 'Z', stat.st_size, summary[:1200]),
+            )
+            symbols = entry.get('symbols', {})
+            for stype in ('functions', 'classes'):
+                for s in symbols.get(stype, []):
+                    conn.execute(
+                        'INSERT INTO symbols(path, symbol_name, symbol_type, start_line, end_line) VALUES (?,?,?,?,?)',
+                        (rel, s.get('name', ''), stype[:-1], int(s.get('line_start', 1)), int(s.get('line_end', s.get('line_start', 1)))),
+                    )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"db_path": str(db_path), "files": len(entries)}
+
 def handle(root: Path, command: Dict[str, Any]) -> Dict[str, Any]:
     action = command.get('action')
     if action == 'summarize_attachment':
@@ -600,7 +1009,17 @@ def handle(root: Path, command: Dict[str, Any]) -> Dict[str, Any]:
             'lines': len(content.splitlines()),
         })
     if action == 'analyze_project':
-        return ok({"index": index_project(root)})
+        entries = index_project(root)
+        return ok({"index": entries})
+    if action == 'index_project_cache':
+        entries = index_project(root)
+        return ok({"index": entries, "cache": persist_index_sqlite(root, entries)})
+    if action == 'list_project_files':
+        return ok({"files": [rel_path(root, p) for p in iter_files(root)]})
+    if action == 'search_files':
+        return ok({"results": search_project(root, command.get('query', ''), command.get('mode', 'keyword'), int(command.get('limit', 20)) )})
+    if action == 'search_symbols':
+        return ok({"results": search_symbols(root, str(command.get('query', '')), int(command.get('limit', 25)) )})
     if action == 'smart_search':
         return ok({"results": search_project(root, command.get('query', ''), command.get('mode', 'keyword'), int(command.get('limit', 10)))})
     if action == 'replace_body':
@@ -626,11 +1045,69 @@ def handle(root: Path, command: Dict[str, Any]) -> Dict[str, Any]:
             return fail('Target file does not exist')
         content = file_path.read_text(encoding='utf-8', errors='ignore')
         return ok({"path": rel, "content": content})
+    if action == 'read_file':
+        try:
+            return ok(read_file_span(root, str(command.get('path', '')), int(command.get('start_line', 1)), int(command.get('end_line', 200))))
+        except Exception as exc:
+            return fail(str(exc))
+    if action == 'read_symbol':
+        query = str(command.get('symbol_name', '')).strip()
+        hits = search_symbols(root, query, int(command.get('limit', 5)))
+        if not hits:
+            return fail('Symbol not found')
+        top = hits[0]
+        return ok(read_file_span(root, top['path'], int(top['start_line']) - 10, int(top['end_line']) + 20))
     if action == 'create_file':
         info = create_file(root, command.get('path', ''), command.get('content', ''))
         return ok({"created": info})
+    if action == 'get_repo_summary':
+        return ok({"summary": get_repo_summary(root)})
+    if action == 'get_file_summary':
+        try:
+            return ok({"summary": get_file_summary(root, str(command.get('path', '')))})
+        except Exception as exc:
+            return fail(str(exc))
+    if action == 'get_related_files':
+        return ok({"files": get_related_files(root, str(command.get('path', '')), int(command.get('limit', 12)))})
+    if action == 'get_changed_files':
+        return ok({"files": get_changed_files(root)})
+    if action == 'plan_task':
+        return ok({"plan": plan_task(str(command.get('task', '')))})
+    if action == 'retrieve_context':
+        return ok({"context": retrieve_context(root, str(command.get('task', '')), int(command.get('max_files', 5)), int(command.get('span_lines', 140)))})
+    if action == 'create_snapshot':
+        try:
+            return ok({"snapshot": create_snapshot(root, str(command.get('note', '')))})
+        except Exception as exc:
+            return fail(str(exc))
+    if action == 'rollback_snapshot':
+        try:
+            return ok({"rollback": rollback_snapshot(root, str(command.get('snapshot_id', '')))})
+        except Exception as exc:
+            return fail(str(exc))
+    if action == 'get_last_errors':
+        return ok({"errors": _read_last_errors(root)})
+    if action == 'run_format':
+        command_paths = command.get('paths', []) if isinstance(command.get('paths', []), list) else []
+        return ok({"result": run_validations(root, command_paths, [])})
+    if action == 'run_lint':
+        command_paths = command.get('paths', []) if isinstance(command.get('paths', []), list) else []
+        return ok({"result": run_validations(root, command_paths, [])})
+    if action == 'run_tests':
+        targets = command.get('targets', []) if isinstance(command.get('targets', []), list) else []
+        return ok({"result": run_validations(root, [], targets)})
+    if action == 'run_build':
+        if _self_contained_mode():
+            return ok({"result": {"ok": True, "skipped": True, "reason": 'Disabled in strict self-contained mode unless a bundled build tool is configured.'}})
+        if _has_tool('npm'):
+            return ok({"result": _safe_run(root, ['npm', 'run', 'build'])})
+        if _has_tool('pnpm'):
+            return ok({"result": _safe_run(root, ['pnpm', 'build'])})
+        return ok({"result": {"ok": True, "skipped": True, "reason": 'No build tool found'}})
     if action == 'validate':
-        return ok({"validation": run_validations(root)})
+        paths = command.get('paths', []) if isinstance(command.get('paths', []), list) else []
+        tests = command.get('tests', []) if isinstance(command.get('tests', []), list) else []
+        return ok({"validation": run_validations(root, paths, tests)})
     return fail(f'Unknown action: {action}')
 
 

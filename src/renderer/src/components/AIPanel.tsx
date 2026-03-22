@@ -129,7 +129,11 @@ interface SandboxTask {
 const SYSTEM_PROMPT = `You are Kivode+ AI, an expert coding assistant.
 Guidelines:
 - You are in EDITING MODE for existing projects only
-- Always return JSON editing instructions suitable for diff-based workflows
+- Always return patch-based editing instructions suitable for diff workflows
+- Primary format: KIVODE_PATCH blocks (never JSON objects in edit mode):
+  [[[KIVODE_PATCH|relative/path.ext]]]
+  @@ unified diff hunks @@
+  [[[/KIVODE_PATCH]]]
 - Prefer minimal, safe, and reversible modifications
 - Use best practices and modern patterns
 - Include error handling where relevant`;
@@ -164,7 +168,31 @@ const getProviderStrictJsonPrompt = (modelId: string | null | undefined, task: '
   if (id.includes('kimi') || id.includes('moonshot')) {
     return `${base}\n${taskRules[task]}\nKimi-specific rule: output exactly one JSON payload with no trailing commentary.`;
   }
-  return `${base}\n${taskRules[task]}\nOpenAI-style rule: deterministic JSON-only response.`;
+  return `${base}
+${taskRules[task]}
+OpenAI-style rule: deterministic JSON-only response.`;
+};
+
+const getProviderStablePatchPrompt = (modelId: string | null | undefined) => {
+  const id = String(modelId || '').toLowerCase();
+  const base = [
+    'You are operating in machine-action edit mode.',
+    'Do NOT return JSON objects for edits.',
+    'Return only patch blocks using one of these formats:',
+    '1) [[[KIVODE_PATCH|relative/path.ext]]] ...unified diff hunks... [[[/KIVODE_PATCH]]]',
+    '2) ```diff file=relative/path.ext\n@@ ...\n```',
+    'If full-file replacement is required, return:',
+    '[[[KIVODE_FILE|relative/path.ext]]]\n<full updated file content>\n[[[/KIVODE_FILE]]]',
+    'No prose outside patch/file blocks.',
+  ].join('\n');
+
+  if (id.includes('deepseek')) {
+    return `${base}\nDeepSeek rule: avoid conversational text and return patch/file blocks only.`;
+  }
+  if (id.includes('gemini')) {
+    return `${base}\nGemini rule: do not wrap output in additional markdown explanation.`;
+  }
+  return `${base}\nProvider rule: deterministic patch/file blocks only.`;
 };
 
 // Transparent provider logos that follow the active theme color.
@@ -471,6 +499,12 @@ const isRequestInFlightError = (error: any): boolean => {
   return code === 'REQUEST_IN_FLIGHT' || message.includes('REQUEST_IN_FLIGHT');
 };
 
+const isApiKeyConfigurationError = (error: any): boolean => {
+  const message = String(error?.message || '').toLowerCase();
+  const statusCode = error?.response?.status || error?.status;
+  return message.includes('api_key_missing') || message.includes('invalid_api_key') || statusCode === 401 || statusCode === 403;
+};
+
 const getErrorMessage = (error: any): string => {
   const message = error?.message || '';
   const statusCode = error?.response?.status || error?.status;
@@ -695,6 +729,25 @@ export function AIPanel() {
     return normalized;
   };
 
+  const isTextEditablePath = (pathValue: string): boolean => {
+    const rel = sanitizeRelativePath(pathValue) || pathValue.replace(/\\/g, '/');
+    if (!rel) return false;
+
+    const lower = rel.toLowerCase();
+    const blockedExts = [
+      '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.svg', '.avif', '.tiff',
+      '.mp3', '.wav', '.ogg', '.flac', '.mp4', '.mov', '.avi', '.mkv',
+      '.pdf', '.zip', '.rar', '.7z', '.tar', '.gz', '.exe', '.dll', '.so', '.dylib', '.bin', '.woff', '.woff2', '.ttf', '.eot'
+    ];
+
+    if (blockedExts.some((ext) => lower.endsWith(ext))) return false;
+    if (/\/(assets|images|img|icons|fonts)\//i.test(lower) && !/\.(md|txt|json|ya?ml|toml|xml|html?|css|scss|less|js|jsx|ts|tsx|py|java|c|cc|cpp|h|hpp|go|rs|rb|php|swift|kt|dart|sql|sh|bash|zsh|ps1)$/i.test(lower)) {
+      return false;
+    }
+
+    return true;
+  };
+
 
   const parseFileBlocks = (content: string): GeneratedProjectFile[] => {
     const files: GeneratedProjectFile[] = [];
@@ -774,16 +827,65 @@ export function AIPanel() {
   };
 
   const createFallbackInstructions = (rawOutput: string) => {
+    const extractDelimitedPatchBlocks = () => {
+      const instructions: any[] = [];
+      const blockRegex = /\[\[\[KIVODE_PATCH\|([^\]]+)\]\]\]\s*([\s\S]*?)\s*\[\[\[\/KIVODE_PATCH\]\]\]/gi;
+      let match: RegExpExecArray | null;
+      while ((match = blockRegex.exec(rawOutput)) !== null) {
+        const file = sanitizeRelativePath((match[1] || '').trim());
+        const patch = (match[2] || '').trim();
+        if (!file || !patch) continue;
+        instructions.push({ action: 'apply_patch', file, patch });
+      }
+      return instructions;
+    };
+
+    const extractDiffFenceBlocks = () => {
+      const instructions: any[] = [];
+      const fenceRegex = /```(?:diff|patch)([^\n`]*)\n([\s\S]*?)```/gi;
+      let match: RegExpExecArray | null;
+      while ((match = fenceRegex.exec(rawOutput)) !== null) {
+        const info = String(match[1] || '').trim();
+        const patch = String(match[2] || '').trim();
+        if (!patch) continue;
+
+        const infoFileMatch = info.match(/(?:file|path)\s*=\s*([^\s]+)/i);
+        const nearbyPrefix = rawOutput.slice(Math.max(0, match.index - 220), match.index);
+        const prefixFileMatch = nearbyPrefix.match(/(?:file|path)\s*[:=]\s*([^\s\n`]+)/i);
+        const fileCandidate = infoFileMatch?.[1] || prefixFileMatch?.[1] || '';
+        const file = sanitizeRelativePath(fileCandidate);
+        if (!file) continue;
+
+        instructions.push({ action: 'apply_patch', file, patch });
+      }
+      return instructions;
+    };
+
+    const fromDelimitedBlocks = extractDelimitedPatchBlocks();
+    if (fromDelimitedBlocks.length > 0) return fromDelimitedBlocks;
+
+    const fileBlocks: any[] = [];
+    const fileBlockRegex = /\[\[\[KIVODE_FILE\|([^\]]+)\]\]\]\s*([\s\S]*?)\s*\[\[\[\/KIVODE_FILE\]\]\]/gi;
+    let fileMatch: RegExpExecArray | null;
+    while ((fileMatch = fileBlockRegex.exec(rawOutput)) !== null) {
+      const file = sanitizeRelativePath((fileMatch[1] || '').trim());
+      const content = (fileMatch[2] || '').trim();
+      if (!file || !content) continue;
+      fileBlocks.push({ action: 'rewrite_file', file, content });
+    }
+    if (fileBlocks.length > 0) return fileBlocks;
+
+    const fromDiffFences = extractDiffFenceBlocks();
+    if (fromDiffFences.length > 0) return fromDiffFences;
+
+    const parsedJson = extractJsonInstruction(rawOutput);
+    if (parsedJson && typeof parsedJson === 'object') {
+      const normalized = normalizeInstructions(parsedJson).filter((x: any) => x && typeof x === 'object');
+      if (normalized.length > 0) return normalized;
+    }
+
     const actionMatch = rawOutput.match(/\b(apply_patch|replace_body|open_file|create_file|needs_context)\b/i);
     if (!actionMatch) return [];
-
-    const patchBlock = rawOutput.match(/```diff\s*([\s\S]*?)```/i)?.[1]?.trim();
-    const fileMatch = rawOutput.match(/(?:file|path)\s*[:=]\s*([^\s\n`]+)/i);
-    const normalizedPath = fileMatch?.[1] ? sanitizeRelativePath(fileMatch[1]) : null;
-
-    if (patchBlock && normalizedPath) {
-      return [{ action: 'apply_patch', file: normalizedPath, patch: patchBlock }];
-    }
 
     return [{
       action: 'needs_context',
@@ -800,6 +902,15 @@ export function AIPanel() {
     const fenced = raw.match(/```(?:[\w.+-]+)?\n([\s\S]*?)```/);
     if (fenced?.[1]) return fenced[1].trim();
     return raw.trim();
+  };
+
+  const extractNarrativeRewriteCandidate = (raw: string): string | null => {
+    const fenced = raw.match(/```(?:markdown|md|text|[\w.+-]*)\n([\s\S]*?)```/i);
+    const content = fenced?.[1]?.trim();
+    if (!content || content.length < 12) return null;
+    const looksLikeJson = /^[\[{]/.test(content) && /"(?:action|patch|file|actions)"\s*:/.test(content);
+    if (looksLikeJson) return null;
+    return content;
   };
 
   const normalizePath = (value: string) => value.replace(/\\/g, '/');
@@ -1353,9 +1464,66 @@ ${allClasses.join('\n') || 'None'}`;
     return out;
   };
 
-  const planTargetFilesForModify = async (promptText: string, candidates: Array<{ path: string }>): Promise<string[]> => {
+  const extractExplicitFileTargets = (promptText: string, candidatePaths: string[]): string[] => {
+    const normalizedPrompt = String(promptText || '').trim();
+    if (!normalizedPrompt) return [];
+
+    const lowerCandidates = candidatePaths.map((p) => ({ path: p, lower: p.toLowerCase() }));
+    const requestedTokens = new Set<string>();
+
+    const fileTokenRegex = /(?:^|[\s"'`(\[])([a-zA-Z0-9_./-]+\.[a-zA-Z0-9]+)(?=$|[\s"'`),\]])/g;
+    let tokenMatch: RegExpExecArray | null;
+    while ((tokenMatch = fileTokenRegex.exec(normalizedPrompt)) !== null) {
+      const token = sanitizeRelativePath(tokenMatch[1] || '');
+      if (token) requestedTokens.add(token.toLowerCase());
+    }
+
+    if (/\breadme\b/i.test(normalizedPrompt)) requestedTokens.add('readme.md');
+
+    if (requestedTokens.size === 0) return [];
+
+    const scored: Array<{ path: string; score: number }> = [];
+
+    for (const token of requestedTokens) {
+      const matches = lowerCandidates
+        .filter((c) => c.lower === token || c.lower.endsWith(`/${token}`))
+        .map((c) => c.path);
+
+      for (const path of matches) {
+        const depth = path.split('/').length;
+        const exact = path.toLowerCase() === token ? 0 : 1;
+        const score = exact * 100 + depth;
+        scored.push({ path, score });
+      }
+    }
+
+    return scored
+      .sort((a, b) => a.score - b.score)
+      .map((s) => s.path)
+      .filter((path, idx, arr) => arr.indexOf(path) === idx)
+      .slice(0, 3);
+  };
+
+  const planTargetFilesForModify = async (promptText: string, candidates: Array<{ path: string }>, preferredActiveRelative?: string | null): Promise<string[]> => {
     if (!candidates.length) return [];
     const shortList = candidates.slice(0, 40);
+    const explicitTargets = extractExplicitFileTargets(promptText, candidates.map((c) => c.path));
+
+    if (preferredActiveRelative && /\b(this|current|same|active)\s+file\b/i.test(promptText)) {
+      const activeRel = sanitizeRelativePath(preferredActiveRelative);
+      if (activeRel) {
+        const activeMatch = candidates.find((c) => c.path.toLowerCase() === activeRel.toLowerCase());
+        if (activeMatch) {
+          appendExecutionLog(`Prompt requested active file; locking target: ${activeMatch.path}`);
+          return [activeMatch.path];
+        }
+      }
+    }
+
+    if (explicitTargets.length > 0) {
+      appendExecutionLog(`Explicit file target(s) detected from user prompt: ${explicitTargets.join(', ')}`);
+      return explicitTargets;
+    }
 
     const plannerPrompt = `Pick target files for this edit task. File selection must be model-driven, not python-driven.
 
@@ -1366,8 +1534,10 @@ Candidate files:
 ${shortList.map((c, i) => `${i + 1}. ${c.path}`).join('\n')}
 
 Rules:
-- Return 1-10 files max.
-- Select only directly relevant files.
+- Return only files that are explicitly requested or directly required by the user request.
+- If the user mentions an exact filename/path, that file MUST be included and ranked first.
+- Avoid broad same-extension expansion (example: do not open all *.md files for a single README request).
+- Return 1-6 files max.
 - Return strict JSON only with schema: {"paths":["relative/path1","relative/path2"],"reason":"..."}`;
 
     try {
@@ -1383,8 +1553,9 @@ Rules:
       const selected = (Array.isArray(payload?.paths) ? payload.paths : [])
         .map((p: string) => sanitizeRelativePath(p))
         .filter((p: string | null): p is string => Boolean(p))
-        .filter((p: string) => shortList.some((c) => c.path === p))
-        .slice(0, 10);
+        .map((p: string) => candidates.find((c) => c.path.toLowerCase() === p.toLowerCase())?.path || null)
+        .filter((p: string | null): p is string => Boolean(p))
+        .slice(0, 6);
 
       if (selected.length) {
         appendExecutionLog(`AI target planner selected files: ${selected.join(', ')}`);
@@ -1394,18 +1565,23 @@ Rules:
       appendExecutionLog(`AI target planner fallback: ${error?.message || 'unknown error'}`);
     }
 
-    return shortList.slice(0, 2).map((c) => c.path);
+    const readmeFirst = candidates.find((c) => /(^|\/)readme\.md$/i.test(c.path));
+    if (readmeFirst) return [readmeFirst.path];
+
+    return shortList.filter((c) => /readme|index|main|app|src\//i.test(c.path)).slice(0, 1).map((c) => c.path).concat(shortList.slice(0,1).map((c)=>c.path)).slice(0,1);
   };
 
-  const resolveTargetFilesForModify = async (promptText: string) => {
+  const resolveTargetFilesForModify = async (promptText: string, preferredActivePath?: string | null) => {
     if (!projectPath) return [] as any[];
     const fileCandidates = flattenProjectFileTree(fileTree || [])
       .filter((item) => !item.startsWith('.kivode/'))
+      .filter((item) => isTextEditablePath(item))
       .map((path) => ({ path }));
 
     if (!fileCandidates.length) return [] as any[];
 
-    const selectedPaths = await planTargetFilesForModify(promptText, fileCandidates);
+    const preferredActiveRelative = preferredActivePath ? toRelativeModelPath(preferredActivePath) : null;
+    const selectedPaths = await planTargetFilesForModify(promptText, fileCandidates, preferredActiveRelative);
     const openedTargets: any[] = [];
 
     for (const relPath of selectedPaths) {
@@ -1524,6 +1700,46 @@ Rules:
     }
 
     return Array.from(collected.values()).slice(0, 10);
+  };
+
+  const buildPostEditModelSummary = async (params: {
+    userPrompt: string;
+    touchedFiles: string[];
+    openedDiff: boolean;
+    createdFiles: number;
+    executionLogs: string[];
+  }): Promise<string | null> => {
+    try {
+      const summaryPrompt = [
+        'You are generating the final user-facing edit summary for the chat.',
+        'Respond in the SAME language as the user request.',
+        'Use direct, clear style (2-6 bullet points).',
+        'Explain what changed, why, and how it was applied.',
+        'Do not output JSON.',
+        '',
+        `User request:
+${params.userPrompt}`,
+        `Touched files: ${params.touchedFiles.join(', ') || 'unknown'}`,
+        `Diff opened: ${params.openedDiff ? 'yes' : 'no'}`,
+        `Created files count: ${params.createdFiles}`,
+        'Execution highlights:',
+        ...params.executionLogs.slice(-8),
+      ].join('\n');
+
+      const summary = await window.electronAPI.ai.reviewCode({
+        model: selectedModel,
+        prompt: summaryPrompt,
+        systemPrompt: 'You are Kivode+ assistant. Reply in the user language with a concise final summary of completed code edits.',
+        temperature: 0.2,
+        maxTokens: 260,
+        operation: 'review',
+      });
+
+      const content = String(summary?.content || '').trim();
+      return content || null;
+    } catch {
+      return null;
+    }
   };
 
   const streamAssistantMessage = async (baseMessages: Message[], content: string, operationType: OperationType) => {
@@ -2207,7 +2423,7 @@ ${titleContext}`,
 
       let plannedTargetFiles: any[] = [];
       if (finalIntent === 'edit' && !resolvedCreateFileIntent && projectPath) {
-        plannedTargetFiles = await resolveTargetFilesForModify(userMessage.content);
+        plannedTargetFiles = await resolveTargetFilesForModify(userMessage.content, activeFileData?.path || null);
         if (!activeFileData && plannedTargetFiles.length > 0) {
           activeFileData = plannedTargetFiles[0];
           appendExecutionLog(`Primary target file selected: ${activeFileData.path}`);
@@ -2258,15 +2474,24 @@ ${titleContext}`,
         arr.findIndex((x) => x.path === file.path) === index
       );
 
+      const targetPaths = plannedTargetFiles.map((f: any) => toRelativeModelPath(f.path));
+      const singleTargetLock = targetPaths.length === 1
+        ? `- Strict target lock: edit ONLY this file unless the user explicitly requested additional files: ${targetPaths[0]}`
+        : '- You may modify multiple related files in one run.';
+
       const multiFileEditPrompt = finalIntent === 'edit' && plannedTargetFiles.length > 0
         ? `${userMessage.content}
 
 Execution requirements:
-- You may modify multiple related files in one run.
-- Use strict JSON actions only.
-- Include explicit \"file\" for each edit action.
+${singleTargetLock}
+- Use patch/file blocks only (no JSON objects).
+- Include explicit target file for each patch/file block.
 - Continue producing actions until all impacted files are covered.
-- Candidate target files: ${plannedTargetFiles.map((f: any) => toRelativeModelPath(f.path)).join(', ')}`
+- Return KIVODE_PATCH blocks exactly in this form (no JSON objects):
+  [[[KIVODE_PATCH|relative/path.ext]]]
+  @@ unified diff hunks @@
+  [[[/KIVODE_PATCH]]]
+- Candidate target files: ${targetPaths.join(', ')}`
         : userMessage.content;
 
       const attachmentEditPromptHint = attachmentEditIntent
@@ -2280,7 +2505,7 @@ Execution requirements:
           ? 'You are Kivode+ AI assistant. Respond naturally in the user language with concise, helpful conversational answers. Do not output JSON unless explicitly asked. If you output any source/file content (including .md), you MUST wrap it in fenced code blocks with the correct language tag (use markdown as language tag for .md).'
           : (resolvedCreateFileIntent
             ? `You are Kivode+ AI in FILE GENERATION MODE. Return strict JSON only.\nRequired schema: {"files":[{"path":"relative/path.ext","content":"..."}]}\nNever return markdown or prose.\n\n${getProviderStrictJsonPrompt(selectedModel, 'file_repair')}`
-            : `${SYSTEM_PROMPT}\n\nAttachment rule: if you need full content of an uploaded attachment, return open_file action with path like \"attachment/<filename>\" before proposing edits.\n\n${getProviderStrictJsonPrompt(selectedModel, 'editor')}`),
+            : `${SYSTEM_PROMPT}\n\nAttachment rule: if you need full content of an uploaded attachment, return open_file action with path like \"attachment/<filename>\" before proposing edits.\n\n${getProviderStablePatchPrompt(selectedModel)}`),
         conversationHistory: conversationHistory.slice(-20),
         currentFile: activeFileData ? {
           path: activeFileData.path,
@@ -2393,7 +2618,7 @@ Execution requirements:
       if (finalIntent === 'edit' && !resolvedCreateFileIntent && projectPath) {
         setExecutionStatus('parsing');
         appendExecutionLog('Python brain: validating and parsing model plan...');
-        const instructionPayload = extractJsonInstruction(response.content);
+        const instructionPayload = createFallbackInstructions(response.content || "");
 
         setExecutionStatus('patching');
         const ensureInstructionTargetFile = async (instruction: any): Promise<boolean> => {
@@ -2404,6 +2629,10 @@ Execution requirements:
           const relative = sanitizeRelativePath(instruction.file);
 
           if (!relative) return false;
+          if (!isTextEditablePath(relative)) {
+            appendExecutionLog(`Instruction blocked: non-editable target ${relative}`);
+            return false;
+          }
           instruction.file = relative;
           const absolutePath = `${projectPath}/${relative}`.replace(/\/+/g, '/');
           const opened = await openProjectFileByRelativePath(relative) || await openProjectFileInEditor(absolutePath);
@@ -2412,7 +2641,7 @@ Execution requirements:
           appendExecutionLog(`Switched active file from instruction target: ${relative}`);
           return true;
         };
-        if (instructionPayload) {
+        if (Array.isArray(instructionPayload) && instructionPayload.length > 0) {
           const instructions = normalizeInstructions(instructionPayload);
           if (instructions.length === 0) {
             throw new Error('No actionable instruction was found in model response');
@@ -2430,6 +2659,11 @@ Execution requirements:
               const rel = typeof instruction.path === 'string' ? sanitizeRelativePath(instruction.path) : null;
               if (!rel) {
                 appendExecutionLog('open_file ignored: missing relative path');
+                continue;
+              }
+
+              if (!isTextEditablePath(rel) && !rel.startsWith('attachment/')) {
+                appendExecutionLog(`open_file blocked for non-editable asset: ${rel}`);
                 continue;
               }
 
@@ -2479,6 +2713,26 @@ Execution requirements:
               continue;
             }
 
+            if (instruction.action === 'rewrite_file') {
+              const relative = typeof instruction.file === 'string' ? sanitizeRelativePath(instruction.file) : null;
+              const nextContent = typeof instruction.content === 'string' ? instruction.content : null;
+              if (!relative || !nextContent || !isTextEditablePath(relative)) {
+                appendExecutionLog('rewrite_file ignored: invalid or non-editable target');
+                continue;
+              }
+              const absolutePath = `${projectPath}/${relative}`.replace(/\/+/g, '/');
+              const before = await window.electronAPI.file.readFile(absolutePath);
+              if (before !== nextContent) {
+                await window.electronAPI.file.writeFile(absolutePath, nextContent);
+                rollbackSnapshot = { path: absolutePath, before };
+                touchedFiles.add(relative);
+                await streamDiffIntoViewer(before, nextContent, relative);
+                executionOutcome.openedDiff = true;
+                executionOutcome.updatedEditor = true;
+              }
+              continue;
+            }
+
             const hasTargetFile = await ensureInstructionTargetFile(instruction);
             if (!hasTargetFile) {
               appendExecutionLog('Instruction rejected: no resolvable target file was found');
@@ -2520,14 +2774,14 @@ Execution requirements:
             }
           }
         } else {
-          appendExecutionLog('Model returned narrative response, retrying with strict JSON instructions...');
+          appendExecutionLog('Model returned non-actionable output, retrying with strict patch-block instructions...');
           const strictRetry = await window.electronAPI.ai.modifyCode({
             ...requestParams,
-            prompt: `${userMessage.content}\n\nIMPORTANT: Return strict JSON actions only (apply_patch/replace_body/create_file/open_file/needs_context). No prose, no markdown, no full-file rewrites. If target scope is unclear, return needs_context.`,
+            prompt: `${userMessage.content}\n\nIMPORTANT: Do NOT return JSON. Return only KIVODE_PATCH or KIVODE_FILE blocks. No explanations. Use exact project-relative file paths.`,
           });
-          const strictPayload = extractJsonInstruction(strictRetry.content);
+          const strictPayload = createFallbackInstructions(strictRetry.content);
 
-          if (strictPayload) {
+          if (Array.isArray(strictPayload) && strictPayload.length > 0) {
             response = strictRetry;
             const retryInstructions = normalizeInstructions(strictPayload);
             appendExecutionLog(`Strict retry returned ${retryInstructions.length} action(s)`);
@@ -2563,6 +2817,11 @@ Execution requirements:
                   continue;
                 }
 
+                if (!isTextEditablePath(rel)) {
+                  appendExecutionLog(`Retry open_file blocked for non-editable asset: ${rel}`);
+                  continue;
+                }
+
                 const absolutePath = `${projectPath}/${rel}`.replace(/\/+/g, '/');
                 const opened = await openProjectFileByRelativePath(rel) || await openProjectFileInEditor(absolutePath);
                 if (opened) {
@@ -2573,6 +2832,26 @@ Execution requirements:
                 }
                 continue;
               }
+            if (instruction.action === 'rewrite_file') {
+              const relative = typeof instruction.file === 'string' ? sanitizeRelativePath(instruction.file) : null;
+              const nextContent = typeof instruction.content === 'string' ? instruction.content : null;
+              if (!relative || !nextContent || !isTextEditablePath(relative)) {
+                appendExecutionLog('rewrite_file ignored: invalid or non-editable target');
+                continue;
+              }
+              const absolutePath = `${projectPath}/${relative}`.replace(/\/+/g, '/');
+              const before = await window.electronAPI.file.readFile(absolutePath);
+              if (before !== nextContent) {
+                await window.electronAPI.file.writeFile(absolutePath, nextContent);
+                rollbackSnapshot = { path: absolutePath, before };
+                touchedFiles.add(relative);
+                await streamDiffIntoViewer(before, nextContent, relative);
+                executionOutcome.openedDiff = true;
+                executionOutcome.updatedEditor = true;
+              }
+              continue;
+            }
+
               const hasTargetFile = await ensureInstructionTargetFile(instruction);
               if (!hasTargetFile) {
                 appendExecutionLog('Retry instruction rejected: target file could not be resolved');
@@ -2604,10 +2883,10 @@ Execution requirements:
               }
             }
           } else {
-            appendExecutionLog('Strict retry still returned narrative response; attempting JSON action repair...');
+            appendExecutionLog('Strict retry still returned non-actionable output; attempting patch-block repair...');
             const repair = await window.electronAPI.ai.reviewCode({
               model: selectedModel,
-              prompt: `Convert this model output into valid JSON edit actions only.
+              prompt: `Convert this model output into valid KIVODE_PATCH or KIVODE_FILE blocks only.
 
 User request:
 ${userMessage.content}
@@ -2615,18 +2894,17 @@ ${userMessage.content}
 Raw model output:
 ${strictRetry.content}
 
-Allowed actions: apply_patch, replace_body, open_file, needs_context.
-Return strict JSON only.`,
-              systemPrompt: getProviderStrictJsonPrompt(selectedModel, 'repair'),
+Return only patch/file blocks. No JSON, no prose.`,
+              systemPrompt: getProviderStablePatchPrompt(selectedModel),
               temperature: 0,
               maxTokens: 260,
               operation: 'review',
             });
-            const repairedPayload = extractJsonInstruction(repair.content);
-            if (repairedPayload) {
+            const repairedPayload = createFallbackInstructions(repair.content);
+            if (Array.isArray(repairedPayload) && repairedPayload.length > 0) {
               response = repair as any;
               const repairedInstructions = normalizeInstructions(repairedPayload);
-              appendExecutionLog(`JSON repair produced ${repairedInstructions.length} action(s)`);
+              appendExecutionLog(`Patch repair produced ${repairedInstructions.length} action(s)`);
               for (const instruction of repairedInstructions) {
                 if (!instruction || typeof instruction !== 'object') continue;
                 if (instruction.action === 'needs_context') {
@@ -2636,9 +2914,26 @@ Return strict JSON only.`,
                 if (instruction.action === 'open_file') {
                   const rel = typeof instruction.path === 'string' ? sanitizeRelativePath(instruction.path) : null;
                   if (!rel) continue;
+                  if (!isTextEditablePath(rel)) continue;
                   const absolutePath = `${projectPath}/${rel}`.replace(/\/+/g, '/');
                   const opened = await openProjectFileByRelativePath(rel) || await openProjectFileInEditor(absolutePath);
                   if (opened) activeFileData = { ...opened, autoSelected: true };
+                  continue;
+                }
+                if (instruction.action === 'rewrite_file') {
+                  const relative = typeof instruction.file === 'string' ? sanitizeRelativePath(instruction.file) : null;
+                  const nextContent = typeof instruction.content === 'string' ? instruction.content : null;
+                  if (!relative || !nextContent || !isTextEditablePath(relative)) continue;
+                  const absolutePath = `${projectPath}/${relative}`.replace(/\/+/g, '/');
+                  const before = await window.electronAPI.file.readFile(absolutePath);
+                  if (before !== nextContent) {
+                    await window.electronAPI.file.writeFile(absolutePath, nextContent);
+                    rollbackSnapshot = { path: absolutePath, before };
+                    touchedFiles.add(relative);
+                    await streamDiffIntoViewer(before, nextContent, relative);
+                    executionOutcome.openedDiff = true;
+                    executionOutcome.updatedEditor = true;
+                  }
                   continue;
                 }
                 const hasTargetFile = await ensureInstructionTargetFile(instruction);
@@ -2652,13 +2947,38 @@ Return strict JSON only.`,
                 }
               }
             } else {
-              appendExecutionLog('JSON repair failed; attempting fallback action extraction from narrative response...');
+              appendExecutionLog('Patch repair failed; attempting fallback action extraction from model output...');
               const fallbackInstructions = createFallbackInstructions(strictRetry.content || response?.content || '');
               if (fallbackInstructions.length > 0) {
                 appendExecutionLog(`Fallback extraction produced ${fallbackInstructions.length} action(s)`);
                 for (const instruction of fallbackInstructions) {
                   if (!instruction || typeof instruction !== 'object') continue;
                   if (instruction.action === 'needs_context') {
+                    const rawNarrative = strictRetry.content || response?.content || '';
+                    const rewriteCandidate = extractNarrativeRewriteCandidate(rawNarrative);
+                    const targetPath = activeFileData?.path;
+                    const targetRelative = targetPath ? toRelativeModelPath(targetPath) : null;
+
+                    if (rewriteCandidate && targetPath && targetRelative && isTextEditablePath(targetRelative)) {
+                      try {
+                        const before = await window.electronAPI.file.readFile(targetPath);
+                        if (before !== rewriteCandidate) {
+                          await window.electronAPI.file.writeFile(targetPath, rewriteCandidate);
+                          rollbackSnapshot = { path: targetPath, before };
+                          touchedFiles.add(targetRelative);
+                          await streamDiffIntoViewer(before, rewriteCandidate, targetRelative);
+                          executionOutcome.openedDiff = true;
+                          executionOutcome.updatedEditor = true;
+                          appendExecutionLog(`Fallback rewrite mode applied to target file: ${targetRelative}`);
+                        } else {
+                          appendExecutionLog('Fallback rewrite mode produced no content change');
+                        }
+                        continue;
+                      } catch (rewriteError: any) {
+                        appendExecutionLog(`Fallback rewrite mode failed: ${rewriteError?.message || 'unknown error'}`);
+                      }
+                    }
+
                     appendExecutionLog(`Fallback requested more context: ${instruction.reason || 'unspecified'}`);
                     continue;
                   }
@@ -2673,7 +2993,7 @@ Return strict JSON only.`,
                   }
                 }
               } else {
-                appendExecutionLog('JSON repair failed; edit flow requires structured diff actions only');
+                appendExecutionLog('Patch repair failed; edit flow requires structured patch/file blocks');
               }
             }
           }
@@ -2711,7 +3031,7 @@ Return strict JSON only.`,
         finalMessages = streamedChatMessages || await streamAssistantMessage(updatedMessages, response.content, operation);
       } else if (hasAppliedVisualChange) {
         const touched = Array.from(touchedFiles).filter(Boolean);
-        const summaryLines = [
+        const fallbackSummary = [
           '✅ Code mode update completed.',
           touched.length > 0
             ? `Updated files: ${touched.join(', ')}`
@@ -2719,11 +3039,20 @@ Return strict JSON only.`,
           executionOutcome.openedDiff
             ? 'A diff preview was generated for review.'
             : 'Changes were applied directly to the editor files.',
-        ];
+        ].join('\n');
+
+        const modelSummary = await buildPostEditModelSummary({
+          userPrompt: userMessage.content,
+          touchedFiles: touched,
+          openedDiff: executionOutcome.openedDiff,
+          createdFiles: executionOutcome.createdFiles,
+          executionLogs,
+        });
+
         const codeSummaryMessage: Message = {
           id: `assistant-code-summary-${Date.now()}`,
           role: 'assistant',
-          content: summaryLines.join('\n'),
+          content: modelSummary || fallbackSummary,
           timestamp: new Date(),
           type: operation,
           files: touched,
@@ -2774,8 +3103,33 @@ Return strict JSON only.`,
       
       console.error('AI request failed:', error);
       
-      const errorContent = getErrorMessage(error);
-      
+      const defaultErrorContent = getErrorMessage(error);
+      const isApiKeyError = isApiKeyConfigurationError(error);
+      let errorContent = defaultErrorContent;
+
+      if (!isApiKeyError) {
+        try {
+          const modelErrorSummary = await window.electronAPI.ai.reviewCode({
+            model: selectedModel,
+            prompt: `User request:
+${userMessage.content}
+
+Runtime error:
+${String(error?.message || defaultErrorContent)}
+
+Generate a direct reply in the same language as the user. Explain what failed and what the user should do next.`,
+            systemPrompt: 'You are Kivode+ assistant. Provide a direct human reply, no JSON.',
+            temperature: 0.2,
+            maxTokens: 220,
+            operation: 'review',
+          });
+          const transformed = String(modelErrorSummary?.content || '').trim();
+          if (transformed) errorContent = transformed;
+        } catch {
+          // fallback to default mapped error
+        }
+      }
+
       const errorMessage: Message = {
         id: `error-${Date.now()}`,
         role: 'assistant',
